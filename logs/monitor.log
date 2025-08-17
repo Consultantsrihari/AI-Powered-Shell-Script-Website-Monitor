@@ -1,0 +1,2 @@
+cd /path/to/your/project/website-monitor  # Go to the project folder
+./monitor.sh                              # Run the script from there
