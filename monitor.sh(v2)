@@ -1,0 +1,183 @@
+#!/bin/bash
+
+# =================================================================
+#            Website Availability Monitor v2
+#              (with State & Retries)
+# =================================================================
+
+# --- Configuration ---
+CONFIG_FILE="websites.conf"
+LOG_FILE="logs/monitor.log"
+ENV_FILE=".env"
+STATE_FILE="status/status.log" # NEW: File to store the last known status
+
+# --- Constants ---
+MAX_RETRIES=3       # NEW: Number of times to retry a failed check
+RETRY_DELAY=5       # NEW: Seconds to wait between retries
+
+# --- Load Environment Variables ---
+if [ -f "${ENV_FILE}" ]; then
+    export $(grep -v '^#' ${ENV_FILE} | xargs)
+else
+    echo "Error: .env file not found at ${ENV_FILE}"
+    exit 1
+fi
+
+# --- Functions ---
+
+# Function to log messages with a timestamp
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+}
+
+# MODIFIED: Function to send an email alert (now handles different subjects)
+send_email_alert() {
+    local url=$1
+    local reason=$2
+    local subject=$3 # NEW: Pass in the subject line
+    local body="Website: ${url}
+Reason: ${reason}
+Timestamp: $(date '+%Y-%m-%d %H:%M:%S')
+"
+    echo "${body}" | mail -s "${subject}" "${EMAIL_TO}"
+    log "ALERT: Email alert with subject '${subject}' sent to ${EMAIL_TO} for ${url}."
+}
+
+# MODIFIED: Central function to handle sending alerts
+send_alert() {
+    local url=$1
+    local reason=$2
+    local status=$3 # NEW: "DOWN" or "RECOVERY"
+
+    local subject=""
+    if [ "$status" == "DOWN" ]; then
+        subject="⚠️ Website Down Alert: ${url}"
+    elif [ "$status" == "RECOVERY" ]; then
+        subject="✅ Website Recovered: ${url}"
+    else
+        return # Do nothing if status is unknown
+    fi
+
+    case "${ALERT_METHOD}" in
+        "email")
+            send_email_alert "$url" "$reason" "$subject"
+            ;;
+        "log")
+            log "ALERT_TRIGGERED (method=log): Status is ${status} for ${url}. Reason: ${reason}"
+            ;;
+        *)
+            log "WARNING: Unknown ALERT_METHOD '${ALERT_METHOD}'. Defaulting to log."
+            log "ALERT_TRIGGERED (method=log): Status is ${status} for ${url}. Reason: ${reason}"
+            ;;
+    esac
+}
+
+# NEW: Function to get the last known status of a site
+get_last_status() {
+    local url=$1
+    if [ ! -f "${STATE_FILE}" ]; then
+        echo "UP" # Assume UP if state file doesn't exist yet
+        return
+    fi
+    # Find the line for the URL and get the status after the '='
+    grep "^${url}=" "${STATE_FILE}" | cut -d'=' -f2
+}
+
+# NEW: Function to update the status of a site in the state file
+update_status() {
+    local url=$1
+    local status=$2 # "UP" or "DOWN"
+    
+    # Create a temporary file
+    local temp_state_file
+    temp_state_file=$(mktemp)
+
+    # If the state file exists, remove the old entry for this URL
+    if [ -f "${STATE_FILE}" ]; then
+        grep -v "^${url}=" "${STATE_FILE}" > "${temp_state_file}"
+    fi
+    
+    # Add the new status entry
+    echo "${url}=${status}" >> "${temp_state_file}"
+    
+    # Replace the old state file with the new one
+    mv "${temp_state_file}" "${STATE_FILE}"
+}
+
+
+# HEAVILY MODIFIED: Function to check a single website
+check_site() {
+    local url=$1
+    local current_status="UP" # Assume UP initially
+    local reason=""
+
+    # --- Retry Loop ---
+    for (( i=1; i<=MAX_RETRIES; i++ )); do
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "${url}")
+        curl_exit_code=$?
+
+        if [ $curl_exit_code -ne 0 ]; then
+            current_status="DOWN"
+            reason="Connection Error. cURL exit code: ${curl_exit_code}."
+        elif [ "${http_code}" -ge 200 ] && [ "${http_code}" -lt 400 ]; then
+            current_status="UP"
+            reason="HTTP Status Code: ${http_code}."
+            break # Success, no need to retry
+        else
+            current_status="DOWN"
+            reason="HTTP Status Code: ${http_code}."
+        fi
+
+        # If we are not on the last retry, wait before trying again
+        if [ "$current_status" == "DOWN" ] && [ $i -lt $MAX_RETRIES ]; then
+            log "INFO: Check for ${url} failed (Attempt ${i}/${MAX_RETRIES}). Retrying in ${RETRY_DELAY}s..."
+            sleep ${RETRY_DELAY}
+        fi
+    done
+
+    # --- State Comparison Logic ---
+    last_status=$(get_last_status "${url}")
+    # If no previous status, default to UP to avoid alerts on first run
+    last_status=${last_status:-"UP"} 
+
+    echo "Site: ${url} | Current Status: ${current_status} | Last Known Status: ${last_status}"
+
+    if [ "${current_status}" == "DOWN" ] && [ "${last_status}" == "UP" ]; then
+        # It just went down! Send an alert.
+        log "STATE_CHANGE: ${url} has gone DOWN. Reason: ${reason}"
+        send_alert "${url}" "${reason}" "DOWN"
+        update_status "${url}" "DOWN"
+    elif [ "${current_status}" == "UP" ] && [ "${last_status}" == "DOWN" ]; then
+        # It just recovered! Send a recovery alert.
+        log "STATE_CHANGE: ${url} has RECOVERED. Reason: ${reason}"
+        send_alert "${url}" "${reason}" "RECOVERY"
+        update_status "${url}" "UP"
+    elif [ "${current_status}" != "${last_status}" ]; then
+        # This handles the initial run case where a site is UP and last_status is empty
+        update_status "${url}" "${current_status}"
+    else
+        # Status has not changed, just log it quietly
+        log "INFO: Status for ${url} remains ${current_status}."
+    fi
+}
+
+# --- Main Script Logic ---
+
+# Ensure state and log directories exist
+mkdir -p "$(dirname "${LOG_FILE}")"
+mkdir -p "$(dirname "${STATE_FILE}")"
+
+if [ ! -f "${CONFIG_FILE}" ]; then
+    echo "Error: Configuration file not found at ${CONFIG_FILE}"
+    exit 1
+fi
+
+log "--- Monitor script started ---"
+
+while IFS= read -r site || [[ -n "$site" ]]; do
+    if [[ -n "$site" ]]; then
+        check_site "$site"
+    fi
+done < "${CONFIG_FILE}"
+
+log "--- Monitor script finished ---"
